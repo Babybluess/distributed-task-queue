@@ -45,7 +45,7 @@ func main() {
 			To:      "alice@example.com",
 			Subject: "Welcome!",
 			Body:    "Thanks for signing up.",
-		}, 3)
+		}, 3, task.WithPriority(task.PriorityLow))
 		if err := b.Enqueue(ctx, emailTask); err != nil {
 			log.Println("enqueue:", err)
 		}
@@ -54,7 +54,7 @@ func main() {
 			ImageURL: "https://example.com/photo.jpg",
 			Width:    800,
 			Height:   600,
-		}, 5)
+		}, 5, task.WithPriority(task.PriorityHigh))
 		if err := b.Enqueue(ctx, resizeTask); err != nil {
 			log.Println("enqueue:", err)
 		}

@@ -7,27 +7,48 @@ import (
 	"time"
 )
 
+type Priority string
+
+const (
+	PriorityHigh   Priority = "high"
+	PriorityNormal Priority = "normal"
+	PriorityLow    Priority = "low"
+)
+
 type Task struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`
 	Payload   json.RawMessage `json:"payload"`
+	Priority  Priority        `json:"priority"`
 	Retries   int             `json:"retries"`
 	MaxRetry  int             `json:"max_retry"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
-func New(taskType string, payload any, maxRetry int) (*Task, error) {
+// Option customizes a Task at construction time, e.g. WithPriority.
+type Option func(*Task)
+
+func WithPriority(p Priority) Option {
+	return func(t *Task) { t.Priority = p }
+}
+
+func New(taskType string, payload any, maxRetry int, opts ...Option) (*Task, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	return &Task{
+	t := &Task{
 		ID:        fmt.Sprintf("task_%d", time.Now().UnixNano()),
 		Type:      taskType,
 		Payload:   b,
+		Priority:  PriorityNormal,
 		MaxRetry:  maxRetry,
 		CreatedAt: time.Now(),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t, nil
 }
 
 type HandlerFunc func(ctx context.Context, t *Task) error

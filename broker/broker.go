@@ -11,12 +11,32 @@ import (
 )
 
 const (
-	PendingQueue    = "tasks:pending"
+	HighQueue       = "tasks:high"
+	NormalQueue     = "tasks:normal"
+	LowQueue        = "tasks:low"
 	ProcessingSet   = "tasks:processing"
 	RetryQueue      = "tasks:retry"
 	DeadLetterQueue = "tasks:dead"
 	processingTTL   = 5 * time.Minute
+
+	// highPriorityPollTimeout bounds how long Dequeue blocks on a higher
+	// priority list before falling through to check the next one.
+	highPriorityPollTimeout = 100 * time.Millisecond
 )
+
+// priorityQueues lists the pending lists in priority order, highest first.
+var priorityQueues = []string{HighQueue, NormalQueue, LowQueue}
+
+func queueFor(p task.Priority) string {
+	switch p {
+	case task.PriorityHigh:
+		return HighQueue
+	case task.PriorityLow:
+		return LowQueue
+	default:
+		return NormalQueue
+	}
+}
 
 type Broker struct {
 	rdb *redis.Client
@@ -33,11 +53,28 @@ func (b *Broker) Enqueue(ctx context.Context, t *task.Task) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	return b.rdb.LPush(ctx, PendingQueue, data).Err()
+	return b.rdb.LPush(ctx, queueFor(t.Priority), data).Err()
 }
 
 func (b *Broker) Dequeue(ctx context.Context, timeout time.Duration) (*task.Task, error) {
-	result, err := b.rdb.BRPop(ctx, timeout, PendingQueue).Result()
+	pollTimeout := min(highPriorityPollTimeout, timeout)
+
+	for i, queue := range priorityQueues {
+		qTimeout := pollTimeout
+		if i == len(priorityQueues)-1 {
+			qTimeout = timeout
+		}
+
+		t, err := b.dequeueFrom(ctx, queue, qTimeout)
+		if t != nil || err != nil {
+			return t, err
+		}
+	}
+	return nil, nil
+}
+
+func (b *Broker) dequeueFrom(ctx context.Context, queue string, timeout time.Duration) (*task.Task, error) {
+	result, err := b.rdb.BRPop(ctx, timeout, queue).Result()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -89,9 +126,15 @@ func (b *Broker) FlushRetry(ctx context.Context) error {
 	}
 
 	for _, item := range items {
+		queue := NormalQueue
+		var t task.Task
+		if err := json.Unmarshal([]byte(item), &t); err == nil {
+			queue = queueFor(t.Priority)
+		}
+
 		pipe := b.rdb.Pipeline()
 		pipe.ZRem(ctx, RetryQueue, item)
-		pipe.LPush(ctx, PendingQueue, item)
+		pipe.LPush(ctx, queue, item)
 		if _, err := pipe.Exec(ctx); err != nil {
 			return err
 		}
