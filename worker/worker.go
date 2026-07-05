@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -89,19 +90,55 @@ func (w *Worker) loop(ctx context.Context, id int) {
 func (w *Worker) execute(ctx context.Context, t *task.Task) {
 	handler, ok := w.registry.Get(t.Type)
 	if !ok {
-		w.broker.Nack(ctx, t, fmt.Errorf("no handler registered for type %q", t.Type))
+		w.fail(ctx, t, fmt.Errorf("no handler registered for type %q", t.Type))
 		return
 	}
 
 	taskCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if err := handler(taskCtx, t); err != nil {
-		log.Printf("task %s FAILED (attempt %d/%d): %v", t.ID, t.Retries+1, t.MaxRetry, err)
-		w.broker.Nack(ctx, t, err)
+	output, err := handler(taskCtx, t)
+	if err != nil {
+		w.fail(ctx, t, err)
 		return
 	}
 
 	log.Printf("task %s DONE", t.ID)
 	w.broker.Ack(ctx, t)
+
+	raw, err := marshalOutput(output)
+	if err != nil {
+		log.Printf("task %s: marshal output: %v", t.ID, err)
+	}
+	w.storeResult(ctx, t, task.StatusSuccess, raw, "")
+}
+
+// fail records a failed attempt and, once the task has exhausted its
+// retries (Nack has dead-lettered it), stores the final failure result.
+func (w *Worker) fail(ctx context.Context, t *task.Task, err error) {
+	log.Printf("task %s FAILED (attempt %d/%d): %v", t.ID, t.Retries+1, t.MaxRetry, err)
+	w.broker.Nack(ctx, t, err)
+	if t.Retries >= t.MaxRetry {
+		w.storeResult(ctx, t, task.StatusFailure, nil, err.Error())
+	}
+}
+
+func (w *Worker) storeResult(ctx context.Context, t *task.Task, status task.ResultStatus, output json.RawMessage, errMsg string) {
+	r := &task.Result{
+		TaskID:      t.ID,
+		Status:      status,
+		Output:      output,
+		Error:       errMsg,
+		CompletedAt: time.Now(),
+	}
+	if err := w.broker.SetResult(ctx, r); err != nil {
+		log.Printf("task %s: store result: %v", t.ID, err)
+	}
+}
+
+func marshalOutput(output any) (json.RawMessage, error) {
+	if output == nil {
+		return nil, nil
+	}
+	return json.Marshal(output)
 }

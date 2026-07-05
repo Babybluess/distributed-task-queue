@@ -57,7 +57,9 @@ func New(taskType string, payload any, maxRetry int, opts ...Option) (*Task, err
 	return t, nil
 }
 
-type HandlerFunc func(ctx context.Context, t *Task) error
+// HandlerFunc processes a task. The returned value, if non-nil, is
+// JSON-marshaled and stored as the task's Result.Output on success.
+type HandlerFunc func(ctx context.Context, t *Task) (any, error)
 
 type Registry struct {
 	handlers map[string]HandlerFunc

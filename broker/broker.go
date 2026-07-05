@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,6 +21,10 @@ const (
 	DeadLetterQueue = "tasks:dead"
 	processingTTL   = 5 * time.Minute
 
+	// resultTTL bounds how long a completed task's result stays in Redis
+	// before expiring, so the result hashes don't grow unbounded.
+	resultTTL = 24 * time.Hour
+
 	// highPriorityPollTimeout bounds how long Dequeue blocks on a higher
 	// priority list before falling through to check the next one.
 	highPriorityPollTimeout = 100 * time.Millisecond
@@ -27,6 +32,18 @@ const (
 
 // priorityQueues lists the pending lists in priority order, highest first.
 var priorityQueues = []string{HighQueue, NormalQueue, LowQueue}
+
+// ErrResultNotFound is returned by GetResult when a task hasn't completed
+// yet (or its result has expired).
+var ErrResultNotFound = errors.New("broker: result not found")
+
+func resultKey(taskID string) string {
+	return "task:result:" + taskID
+}
+
+func resultChannel(taskID string) string {
+	return "task:result:" + taskID + ":events"
+}
 
 func queueFor(p task.Priority) string {
 	switch p {
@@ -161,4 +178,82 @@ func (b *Broker) flushDueSet(ctx context.Context, set string) error {
 		}
 	}
 	return nil
+}
+
+// SetResult stores a task's outcome in a Redis hash keyed by task ID and
+// publishes it on that task's result channel, so producers can either poll
+// GetResult or subscribe via WatchResult.
+func (b *Broker) SetResult(ctx context.Context, r *task.Result) error {
+	fields := map[string]any{
+		"task_id":      r.TaskID,
+		"status":       string(r.Status),
+		"error":        r.Error,
+		"completed_at": r.CompletedAt.Format(time.RFC3339Nano),
+	}
+	if len(r.Output) > 0 {
+		fields["output"] = string(r.Output)
+	}
+
+	key := resultKey(r.TaskID)
+	pipe := b.rdb.Pipeline()
+	pipe.HSet(ctx, key, fields)
+	pipe.Expire(ctx, key, resultTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("store result: %w", err)
+	}
+
+	data, err := json.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("marshal result: %w", err)
+	}
+	return b.rdb.Publish(ctx, resultChannel(r.TaskID), data).Err()
+}
+
+// GetResult polls for a task's stored result. It returns ErrResultNotFound
+// if the task hasn't completed (or its result already expired).
+func (b *Broker) GetResult(ctx context.Context, taskID string) (*task.Result, error) {
+	fields, err := b.rdb.HGetAll(ctx, resultKey(taskID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, ErrResultNotFound
+	}
+
+	r := &task.Result{
+		TaskID: fields["task_id"],
+		Status: task.ResultStatus(fields["status"]),
+		Error:  fields["error"],
+	}
+	if output := fields["output"]; output != "" {
+		r.Output = json.RawMessage(output)
+	}
+	if completedAt, err := time.Parse(time.RFC3339Nano, fields["completed_at"]); err == nil {
+		r.CompletedAt = completedAt
+	}
+	return r, nil
+}
+
+// WatchResult subscribes to taskID's completion event, delivering the
+// Result on the returned channel as soon as SetResult publishes it.
+func (b *Broker) WatchResult(ctx context.Context, taskID string) (<-chan *task.Result, func(), error) {
+	sub := b.rdb.Subscribe(ctx, resultChannel(taskID))
+	if _, err := sub.Receive(ctx); err != nil {
+		sub.Close()
+		return nil, nil, fmt.Errorf("subscribe: %w", err)
+	}
+
+	out := make(chan *task.Result, 1)
+	go func() {
+		defer close(out)
+		for msg := range sub.Channel() {
+			var r task.Result
+			if err := json.Unmarshal([]byte(msg.Payload), &r); err != nil {
+				continue
+			}
+			out <- &r
+		}
+	}()
+
+	return out, func() { sub.Close() }, nil
 }
