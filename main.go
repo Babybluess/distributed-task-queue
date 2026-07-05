@@ -27,6 +27,13 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 
 	registry := task.NewRegistry()
+	registry.Use(
+		task.Recover(),
+		task.Logging(log.Default()),
+		task.Metrics(func(taskType string, dur time.Duration, err error) {
+			log.Printf("metrics: type=%s duration=%s success=%t", taskType, dur, err == nil)
+		}),
+	)
 	registry.Register("send_email", examples.SendEmailHandler)
 	registry.Register("resize_image", examples.ResizeImageHandler)
 

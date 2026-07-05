@@ -62,7 +62,8 @@ func New(taskType string, payload any, maxRetry int, opts ...Option) (*Task, err
 type HandlerFunc func(ctx context.Context, t *Task) (any, error)
 
 type Registry struct {
-	handlers map[string]HandlerFunc
+	handlers   map[string]HandlerFunc
+	middleware []Middleware
 }
 
 func NewRegistry() *Registry {
@@ -73,7 +74,17 @@ func (r *Registry) Register(taskType string, fn HandlerFunc) {
 	r.handlers[taskType] = fn
 }
 
+// Use appends middleware applied to every handler on Get, outermost first.
+// Middleware registered via Use applies globally, regardless of whether it
+// was added before or after the handlers themselves.
+func (r *Registry) Use(mw ...Middleware) {
+	r.middleware = append(r.middleware, mw...)
+}
+
 func (r *Registry) Get(taskType string) (HandlerFunc, bool) {
 	fn, ok := r.handlers[taskType]
-	return fn, ok
+	if !ok {
+		return nil, false
+	}
+	return Chain(r.middleware...)(fn), true
 }
