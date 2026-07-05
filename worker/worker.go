@@ -40,6 +40,9 @@ func (w *Worker) Start(ctx context.Context) {
 				if err := w.broker.FlushRetry(ctx); err != nil {
 					log.Printf("flush retry: %v", err)
 				}
+				if err := w.broker.FlushScheduled(ctx); err != nil {
+					log.Printf("flush scheduled: %v", err)
+				}
 			case <-w.stopCh:
 				return
 			}

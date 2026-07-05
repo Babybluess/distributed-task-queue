@@ -16,13 +16,14 @@ const (
 )
 
 type Task struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
-	Priority  Priority        `json:"priority"`
-	Retries   int             `json:"retries"`
-	MaxRetry  int             `json:"max_retry"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID          string          `json:"id"`
+	Type        string          `json:"type"`
+	Payload     json.RawMessage `json:"payload"`
+	Priority    Priority        `json:"priority"`
+	Retries     int             `json:"retries"`
+	MaxRetry    int             `json:"max_retry"`
+	CreatedAt   time.Time       `json:"created_at"`
+	ScheduledAt *time.Time      `json:"scheduled_at,omitempty"`
 }
 
 // Option customizes a Task at construction time, e.g. WithPriority.
@@ -30,6 +31,11 @@ type Option func(*Task)
 
 func WithPriority(p Priority) Option {
 	return func(t *Task) { t.Priority = p }
+}
+
+// WithScheduledAt delays a task's first execution until the given time.
+func WithScheduledAt(at time.Time) Option {
+	return func(t *Task) { t.ScheduledAt = &at }
 }
 
 func New(taskType string, payload any, maxRetry int, opts ...Option) (*Task, error) {

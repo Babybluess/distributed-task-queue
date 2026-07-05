@@ -16,6 +16,7 @@ const (
 	LowQueue        = "tasks:low"
 	ProcessingSet   = "tasks:processing"
 	RetryQueue      = "tasks:retry"
+	ScheduledQueue  = "tasks:scheduled"
 	DeadLetterQueue = "tasks:dead"
 	processingTTL   = 5 * time.Minute
 
@@ -53,6 +54,12 @@ func (b *Broker) Enqueue(ctx context.Context, t *task.Task) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
+
+	if t.ScheduledAt != nil && t.ScheduledAt.After(time.Now()) {
+		score := float64(t.ScheduledAt.Unix())
+		return b.rdb.ZAdd(ctx, ScheduledQueue, redis.Z{Score: score, Member: data}).Err()
+	}
+
 	return b.rdb.LPush(ctx, queueFor(t.Priority), data).Err()
 }
 
@@ -115,9 +122,23 @@ func (b *Broker) Nack(ctx context.Context, t *task.Task, execErr error) error {
 	return b.rdb.ZAdd(ctx, RetryQueue, redis.Z{Score: retryAt, Member: string(updated)}).Err()
 }
 
+// FlushRetry moves tasks:retry entries whose retry delay has elapsed back
+// onto their priority queue.
 func (b *Broker) FlushRetry(ctx context.Context) error {
+	return b.flushDueSet(ctx, RetryQueue)
+}
+
+// FlushScheduled moves tasks:scheduled entries whose run time has arrived
+// onto their priority queue.
+func (b *Broker) FlushScheduled(ctx context.Context) error {
+	return b.flushDueSet(ctx, ScheduledQueue)
+}
+
+// flushDueSet moves every member of the given sorted set scored at or
+// before now onto its task's priority queue.
+func (b *Broker) flushDueSet(ctx context.Context, set string) error {
 	now := fmt.Sprintf("%f", float64(time.Now().Unix()))
-	items, err := b.rdb.ZRangeByScore(ctx, RetryQueue, &redis.ZRangeBy{
+	items, err := b.rdb.ZRangeByScore(ctx, set, &redis.ZRangeBy{
 		Min: "-inf",
 		Max: now,
 	}).Result()
@@ -133,7 +154,7 @@ func (b *Broker) FlushRetry(ctx context.Context) error {
 		}
 
 		pipe := b.rdb.Pipeline()
-		pipe.ZRem(ctx, RetryQueue, item)
+		pipe.ZRem(ctx, set, item)
 		pipe.LPush(ctx, queue, item)
 		if _, err := pipe.Exec(ctx); err != nil {
 			return err
