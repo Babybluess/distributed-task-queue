@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"gotasks/metrics"
 	"gotasks/task"
 )
 
@@ -74,10 +75,18 @@ func (b *Broker) Enqueue(ctx context.Context, t *task.Task) error {
 
 	if t.ScheduledAt != nil && t.ScheduledAt.After(time.Now()) {
 		score := float64(t.ScheduledAt.Unix())
-		return b.rdb.ZAdd(ctx, ScheduledQueue, redis.Z{Score: score, Member: data}).Err()
+		if err := b.rdb.ZAdd(ctx, ScheduledQueue, redis.Z{Score: score, Member: data}).Err(); err != nil {
+			return err
+		}
+		metrics.TasksEnqueued.WithLabelValues(t.Type, string(t.Priority)).Inc()
+		return nil
 	}
 
-	return b.rdb.LPush(ctx, queueFor(t.Priority), data).Err()
+	if err := b.rdb.LPush(ctx, queueFor(t.Priority), data).Err(); err != nil {
+		return err
+	}
+	metrics.TasksEnqueued.WithLabelValues(t.Type, string(t.Priority)).Inc()
+	return nil
 }
 
 func (b *Broker) Dequeue(ctx context.Context, timeout time.Duration) (*task.Task, error) {
@@ -130,7 +139,11 @@ func (b *Broker) Nack(ctx context.Context, t *task.Task, execErr error) error {
 	if t.Retries >= t.MaxRetry {
 		fmt.Printf("[DLQ] task %s type=%s after %d retries: %v\n", t.ID, t.Type, t.Retries, execErr)
 		dead, _ := json.Marshal(t)
-		return b.rdb.LPush(ctx, DeadLetterQueue, dead).Err()
+		if err := b.rdb.LPush(ctx, DeadLetterQueue, dead).Err(); err != nil {
+			return err
+		}
+		metrics.TasksDeadLettered.WithLabelValues(t.Type).Inc()
+		return nil
 	}
 
 	delay := time.Duration(t.Retries*t.Retries) * 5 * time.Second

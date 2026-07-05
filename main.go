@@ -10,6 +10,7 @@ import (
 
 	"gotasks/broker"
 	"gotasks/examples"
+	"gotasks/metrics"
 	"gotasks/reaper"
 	"gotasks/task"
 	"gotasks/worker"
@@ -30,14 +31,14 @@ func main() {
 	registry.Use(
 		task.Recover(),
 		task.Logging(log.Default()),
-		task.Metrics(func(taskType string, dur time.Duration, err error) {
-			log.Printf("metrics: type=%s duration=%s success=%t", taskType, dur, err == nil)
-		}),
+		task.Metrics(metrics.RecordExecution),
 	)
 	registry.Register("send_email", examples.SendEmailHandler)
 	registry.Register("resize_image", examples.ResizeImageHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	go metrics.Serve(ctx, ":9090")
 
 	r := reaper.New(rdb, b)
 	go r.Run(ctx)

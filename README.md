@@ -40,6 +40,7 @@ gotasks/
 ├── broker/broker.go         Redis enqueue/dequeue/ack/nack/retry/results
 ├── worker/worker.go         Goroutine pool, retry + scheduled flusher
 ├── reaper/reaper.go         Reschedules stuck tasks
+├── metrics/metrics.go       Prometheus counters/histogram, served on :9090/metrics
 └── examples/handlers.go     send_email, resize_image handlers
 ```
 
@@ -119,8 +120,39 @@ registry.Use(
 first middleware passed is outermost. Write your own by matching the
 `Middleware` signature — it composes via `task.Chain`.
 
+## Metrics
+
+Prometheus metrics are served on `:9090/metrics`, so a Grafana dashboard
+comes for free — point a scrape config at that endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: gotasks
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
+| Metric                              | Type      | Labels           | Recorded when                                  |
+|--------------------------------------|-----------|------------------|-------------------------------------------------|
+| `gotasks_tasks_enqueued_total`       | Counter   | `type`, `priority` | `Broker.Enqueue` succeeds                     |
+| `gotasks_tasks_succeeded_total`      | Counter   | `type`           | A handler attempt returns no error              |
+| `gotasks_tasks_failed_total`         | Counter   | `type`           | A handler attempt returns an error (per retry)  |
+| `gotasks_tasks_dead_lettered_total`  | Counter   | `type`           | `Broker.Nack` exhausts retries and dead-letters |
+| `gotasks_task_duration_seconds`      | Histogram | `type`, `outcome`  | Every handler attempt, success or failure     |
+
+Wired in via the existing middleware hook — no handler code changes needed:
+
+```go
+registry.Use(
+    task.Recover(),
+    task.Logging(log.Default()),
+    task.Metrics(metrics.RecordExecution),
+)
+
+go metrics.Serve(ctx, ":9090")
+```
+
 ## Next steps
 
-- Prometheus metrics exporter (wire `task.Metrics` into a real collector)
 - Multi-queue routing per task type
 - Recurring (cron-style) schedules, not just one-shot delayed execution
