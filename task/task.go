@@ -20,6 +20,7 @@ type Task struct {
 	Type        string          `json:"type"`
 	Payload     json.RawMessage `json:"payload"`
 	Priority    Priority        `json:"priority"`
+	Queue       string          `json:"queue,omitempty"`
 	Retries     int             `json:"retries"`
 	MaxRetry    int             `json:"max_retry"`
 	CreatedAt   time.Time       `json:"created_at"`
@@ -33,7 +34,10 @@ func WithPriority(p Priority) Option {
 	return func(t *Task) { t.Priority = p }
 }
 
-// WithScheduledAt delays a task's first execution until the given time.
+func WithQueue(queue string) Option {
+	return func(t *Task) { t.Queue = queue }
+}
+
 func WithScheduledAt(at time.Time) Option {
 	return func(t *Task) { t.ScheduledAt = &at }
 }

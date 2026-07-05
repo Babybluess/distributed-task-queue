@@ -13,9 +13,6 @@ import (
 )
 
 const (
-	HighQueue       = "tasks:high"
-	NormalQueue     = "tasks:normal"
-	LowQueue        = "tasks:low"
 	ProcessingSet   = "tasks:processing"
 	RetryQueue      = "tasks:retry"
 	ScheduledQueue  = "tasks:scheduled"
@@ -31,9 +28,6 @@ const (
 	highPriorityPollTimeout = 100 * time.Millisecond
 )
 
-// priorityQueues lists the pending lists in priority order, highest first.
-var priorityQueues = []string{HighQueue, NormalQueue, LowQueue}
-
 // ErrResultNotFound is returned by GetResult when a task hasn't completed
 // yet (or its result has expired).
 var ErrResultNotFound = errors.New("broker: result not found")
@@ -46,28 +40,54 @@ func resultChannel(taskID string) string {
 	return "task:result:" + taskID + ":events"
 }
 
-func queueFor(p task.Priority) string {
+func queueKey(queue string, p task.Priority) string {
 	switch p {
 	case task.PriorityHigh:
-		return HighQueue
+		return fmt.Sprintf("tasks:%s:high", queue)
 	case task.PriorityLow:
-		return LowQueue
+		return fmt.Sprintf("tasks:%s:low", queue)
 	default:
-		return NormalQueue
+		return fmt.Sprintf("tasks:%s:normal", queue)
+	}
+}
+
+func priorityKeys(queue string) []string {
+	return []string{
+		queueKey(queue, task.PriorityHigh),
+		queueKey(queue, task.PriorityNormal),
+		queueKey(queue, task.PriorityLow),
 	}
 }
 
 type Broker struct {
-	rdb *redis.Client
+	rdb    *redis.Client
+	router *task.Router
 }
 
-func New(addr string) *Broker {
-	return &Broker{
-		rdb: redis.NewClient(&redis.Options{Addr: addr}),
+type Option func(*Broker)
+
+// WithRouter sets the Router used to assign each task's named queue at
+// enqueue time. Without one, every task falls back to task.DefaultQueue.
+func WithRouter(r *task.Router) Option {
+	return func(b *Broker) { b.router = r }
+}
+
+func New(addr string, opts ...Option) *Broker {
+	b := &Broker{
+		rdb:    redis.NewClient(&redis.Options{Addr: addr}),
+		router: task.NewRouter(),
 	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 func (b *Broker) Enqueue(ctx context.Context, t *task.Task) error {
+	if t.Queue == "" {
+		t.Queue = b.router.QueueFor(t.Type)
+	}
+
 	data, err := json.Marshal(t)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -82,23 +102,26 @@ func (b *Broker) Enqueue(ctx context.Context, t *task.Task) error {
 		return nil
 	}
 
-	if err := b.rdb.LPush(ctx, queueFor(t.Priority), data).Err(); err != nil {
+	if err := b.rdb.LPush(ctx, queueKey(t.Queue, t.Priority), data).Err(); err != nil {
 		return err
 	}
 	metrics.TasksEnqueued.WithLabelValues(t.Type, string(t.Priority)).Inc()
 	return nil
 }
 
-func (b *Broker) Dequeue(ctx context.Context, timeout time.Duration) (*task.Task, error) {
+// Dequeue blocks for up to timeout waiting for a task on the named queue,
+// checking its high priority list first, then normal, then low.
+func (b *Broker) Dequeue(ctx context.Context, queue string, timeout time.Duration) (*task.Task, error) {
+	keys := priorityKeys(queue)
 	pollTimeout := min(highPriorityPollTimeout, timeout)
 
-	for i, queue := range priorityQueues {
+	for i, key := range keys {
 		qTimeout := pollTimeout
-		if i == len(priorityQueues)-1 {
+		if i == len(keys)-1 {
 			qTimeout = timeout
 		}
 
-		t, err := b.dequeueFrom(ctx, queue, qTimeout)
+		t, err := b.dequeueFrom(ctx, key, qTimeout)
 		if t != nil || err != nil {
 			return t, err
 		}
@@ -153,19 +176,20 @@ func (b *Broker) Nack(ctx context.Context, t *task.Task, execErr error) error {
 }
 
 // FlushRetry moves tasks:retry entries whose retry delay has elapsed back
-// onto their priority queue.
+// onto their queue.
 func (b *Broker) FlushRetry(ctx context.Context) error {
 	return b.flushDueSet(ctx, RetryQueue)
 }
 
 // FlushScheduled moves tasks:scheduled entries whose run time has arrived
-// onto their priority queue.
+// onto their queue.
 func (b *Broker) FlushScheduled(ctx context.Context) error {
 	return b.flushDueSet(ctx, ScheduledQueue)
 }
 
 // flushDueSet moves every member of the given sorted set scored at or
-// before now onto its task's priority queue.
+// before now onto the priority list of the named queue it was routed to at
+// enqueue time.
 func (b *Broker) flushDueSet(ctx context.Context, set string) error {
 	now := fmt.Sprintf("%f", float64(time.Now().Unix()))
 	items, err := b.rdb.ZRangeByScore(ctx, set, &redis.ZRangeBy{
@@ -177,15 +201,19 @@ func (b *Broker) flushDueSet(ctx context.Context, set string) error {
 	}
 
 	for _, item := range items {
-		queue := NormalQueue
+		queue := task.DefaultQueue
+		priority := task.PriorityNormal
 		var t task.Task
 		if err := json.Unmarshal([]byte(item), &t); err == nil {
-			queue = queueFor(t.Priority)
+			if t.Queue != "" {
+				queue = t.Queue
+			}
+			priority = t.Priority
 		}
 
 		pipe := b.rdb.Pipeline()
 		pipe.ZRem(ctx, set, item)
-		pipe.LPush(ctx, queue, item)
+		pipe.LPush(ctx, queueKey(queue, priority), item)
 		if _, err := pipe.Exec(ctx); err != nil {
 			return err
 		}
@@ -245,6 +273,26 @@ func (b *Broker) GetResult(ctx context.Context, taskID string) (*task.Result, er
 		r.CompletedAt = completedAt
 	}
 	return r, nil
+}
+
+// RunFlusher periodically moves due retries and scheduled tasks onto their
+// queues until ctx is cancelled.
+func (b *Broker) RunFlusher(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := b.FlushRetry(ctx); err != nil {
+				fmt.Printf("flush retry: %v\n", err)
+			}
+			if err := b.FlushScheduled(ctx); err != nil {
+				fmt.Printf("flush scheduled: %v\n", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // WatchResult subscribes to taskID's completion event, delivering the

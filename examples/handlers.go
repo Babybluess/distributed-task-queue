@@ -45,3 +45,37 @@ func ResizeImageHandler(ctx context.Context, t *task.Task) (any, error) {
 	time.Sleep(500 * time.Millisecond)
 	return ResizeResult{Width: p.Width, Height: p.Height}, nil
 }
+
+type WebhookPayload struct {
+	URL  string `json:"url"`
+	Body string `json:"body"`
+}
+
+// SendWebhookHandler is a fast, high-volume task type meant to share a
+// queue with others like it.
+func SendWebhookHandler(ctx context.Context, t *task.Task) (any, error) {
+	var p WebhookPayload
+	if err := json.Unmarshal(t.Payload, &p); err != nil {
+		return nil, fmt.Errorf("bad payload: %w", err)
+	}
+	fmt.Printf("[webhook] POST %s\n", p.URL)
+	time.Sleep(20 * time.Millisecond)
+	return nil, nil
+}
+
+type VideoTranscodePayload struct {
+	VideoURL string `json:"video_url"`
+	Format   string `json:"format"`
+}
+
+// TranscodeVideoHandler is slow and CPU-intensive, so it's routed to its
+// own isolated queue rather than sharing one with fast task types.
+func TranscodeVideoHandler(ctx context.Context, t *task.Task) (any, error) {
+	var p VideoTranscodePayload
+	if err := json.Unmarshal(t.Payload, &p); err != nil {
+		return nil, fmt.Errorf("bad payload: %w", err)
+	}
+	fmt.Printf("[transcode] url=%s format=%s\n", p.VideoURL, p.Format)
+	time.Sleep(3 * time.Second)
+	return nil, nil
+}

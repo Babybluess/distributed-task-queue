@@ -24,7 +24,12 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
-	b := broker.New(redisAddr)
+	router := task.NewRouter()
+	router.Route("send_email", "webhooks")
+	router.Route("send_webhook", "webhooks")
+	router.Route("video_transcode", "video")
+
+	b := broker.New(redisAddr, broker.WithRouter(router))
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 
 	registry := task.NewRegistry()
@@ -35,16 +40,25 @@ func main() {
 	)
 	registry.Register("send_email", examples.SendEmailHandler)
 	registry.Register("resize_image", examples.ResizeImageHandler)
+	registry.Register("send_webhook", examples.SendWebhookHandler)
+	registry.Register("video_transcode", examples.TranscodeVideoHandler)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go metrics.Serve(ctx, ":9090")
+	go b.RunFlusher(ctx, 5*time.Second)
 
 	r := reaper.New(rdb, b)
 	go r.Run(ctx)
 
-	pool := worker.New(b, registry, 5)
-	pool.Start(ctx)
+	pools := []*worker.Worker{
+		worker.New(b, registry, "default", 5),
+		worker.New(b, registry, "webhooks", 20),
+		worker.New(b, registry, "video", 2),
+	}
+	for _, pool := range pools {
+		pool.Start(ctx)
+	}
 
 	go func() {
 		time.Sleep(500 * time.Millisecond)
@@ -67,6 +81,22 @@ func main() {
 			log.Println("enqueue:", err)
 		}
 
+		webhookTask, _ := task.New("send_webhook", examples.WebhookPayload{
+			URL:  "https://example.com/hooks/incoming",
+			Body: `{"event":"user.created"}`,
+		}, 3)
+		if err := b.Enqueue(ctx, webhookTask); err != nil {
+			log.Println("enqueue:", err)
+		}
+
+		transcodeTask, _ := task.New("video_transcode", examples.VideoTranscodePayload{
+			VideoURL: "https://example.com/videos/clip.mov",
+			Format:   "mp4",
+		}, 2)
+		if err := b.Enqueue(ctx, transcodeTask); err != nil {
+			log.Println("enqueue:", err)
+		}
+
 		log.Println("tasks enqueued")
 	}()
 
@@ -76,5 +106,7 @@ func main() {
 
 	log.Println("shutting down...")
 	cancel()
-	pool.Stop()
+	for _, pool := range pools {
+		pool.Stop()
+	}
 }

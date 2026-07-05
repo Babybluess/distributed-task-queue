@@ -18,9 +18,9 @@ go run main.go
 ## Inspect queues
 
 ```bash
-redis-cli LLEN tasks:high
-redis-cli LLEN tasks:normal
-redis-cli LLEN tasks:low
+redis-cli LLEN tasks:default:high    # substitute the queue name, e.g. tasks:webhooks:high
+redis-cli LLEN tasks:default:normal
+redis-cli LLEN tasks:default:low
 redis-cli ZCARD tasks:processing
 redis-cli ZCARD tasks:retry
 redis-cli ZCARD tasks:scheduled
@@ -35,36 +35,70 @@ redis-cli HGETALL task:result:<task_id>
 gotasks/
 ├── main.go                  entrypoint, wires everything together
 ├── task/task.go             Task struct, HandlerFunc, Registry
+├── task/router.go           Router: task type -> named queue
 ├── task/result.go           Result struct (status/output/error per task)
 ├── task/middleware.go       Middleware type, Chain, Logging/Recover/Metrics
 ├── broker/broker.go         Redis enqueue/dequeue/ack/nack/retry/results
-├── worker/worker.go         Goroutine pool, retry + scheduled flusher
+├── worker/worker.go         Goroutine pool bound to one named queue
 ├── reaper/reaper.go         Reschedules stuck tasks
 ├── metrics/metrics.go       Prometheus counters/histogram, served on :9090/metrics
-└── examples/handlers.go     send_email, resize_image handlers
+└── examples/handlers.go     send_email, resize_image, send_webhook, video_transcode handlers
 ```
 
 ## Queue keys in Redis
 
-| Key                 | Type        | Purpose                                |
-|----------------------|-------------|----------------------------------------|
-| tasks:high           | List        | High priority, waiting to be picked up |
-| tasks:normal         | List        | Normal priority (default)              |
-| tasks:low            | List        | Low priority                           |
-| tasks:processing     | Sorted set  | In-flight (score = deadline)           |
-| tasks:retry          | Sorted set  | Delayed retry (score = retry_at)       |
-| tasks:scheduled      | Sorted set  | Delayed first run (score = run_at)     |
-| tasks:dead           | List        | Exhausted all retries                  |
-| task:result:`<id>`   | Hash        | Status/output/error for a completed task (TTL 24h) |
-| task:result:`<id>`:events | Pub/Sub | Published on completion, for `WatchResult` |
+| Key                          | Type        | Purpose                                |
+|-------------------------------|-------------|----------------------------------------|
+| tasks:`<queue>`:high          | List        | High priority, waiting to be picked up |
+| tasks:`<queue>`:normal        | List        | Normal priority (default)              |
+| tasks:`<queue>`:low           | List        | Low priority                           |
+| tasks:processing              | Sorted set  | In-flight (score = deadline)           |
+| tasks:retry                   | Sorted set  | Delayed retry (score = retry_at)       |
+| tasks:scheduled               | Sorted set  | Delayed first run (score = run_at)     |
+| tasks:dead                    | List        | Exhausted all retries                  |
+| task:result:`<id>`            | Hash        | Status/output/error for a completed task (TTL 24h) |
+| task:result:`<id>`:events     | Pub/Sub     | Published on completion, for `WatchResult` |
 
-Workers dequeue by checking `tasks:high` first with a short `BRPOP` timeout
-(100ms), falling through to `tasks:normal` and then blocking on `tasks:low`
-for the remainder of the poll interval. This mirrors Sidekiq Pro's strict
-priority strategy: a busy high queue never starves lower ones, and an idle
-high queue never blocks lower-priority work. Set priority via
-`task.New(..., task.WithPriority(task.PriorityHigh))`; it defaults to
+Within a named queue, workers dequeue by checking its `high` list first with
+a short `BRPOP` timeout (100ms), falling through to `normal` and then
+blocking on `low` for the remainder of the poll interval. This mirrors
+Sidekiq Pro's strict priority strategy: a busy high list never starves lower
+ones, and an idle high list never blocks lower-priority work. Set priority
+via `task.New(..., task.WithPriority(task.PriorityHigh))`; it defaults to
 `task.PriorityNormal`.
+
+## Multi-queue routing
+
+Each task *type* is routed to a named queue via a `task.Router`, so
+producers never have to hardcode queue names — they just create a task by
+type, and routing decides where it lands. Route high-volume, fast task
+types onto a shared queue, and give slow, CPU-heavy ones their own so they
+can't block (or get blocked by) the others:
+
+```go
+router := task.NewRouter()
+router.Route("send_webhook", "webhooks")
+router.Route("send_email", "webhooks")
+router.Route("video_transcode", "video")   // isolated: slow, CPU-heavy
+
+b := broker.New(redisAddr, broker.WithRouter(router))
+```
+
+Task types with no route fall back to `task.DefaultQueue` ("default").
+
+A `worker.Worker` pool is bound to exactly one named queue, so give each
+queue whatever concurrency matches its workload:
+
+```go
+webhooks := worker.New(b, registry, "webhooks", 20) // high volume, cheap
+video    := worker.New(b, registry, "video", 2)      // slow, isolated pool
+webhooks.Start(ctx)
+video.Start(ctx)
+```
+
+Retries and scheduled tasks aren't queue-specific to flush — `Broker.RunFlusher`
+runs once regardless of how many pools exist, and routes each due task back
+onto whichever queue it was originally routed to (stored on `Task.Queue`).
 
 ## Scheduled tasks
 
@@ -154,5 +188,4 @@ go metrics.Serve(ctx, ":9090")
 
 ## Next steps
 
-- Multi-queue routing per task type
 - Recurring (cron-style) schedules, not just one-shot delayed execution
